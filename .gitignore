@@ -1,0 +1,19 @@
+
+# 파이썬 및 가상환경 (필수 보안/용량 절약)
+venv/
+
+# 파이썬 컴파일 캐시 파일들 무시
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 원본 데이터 폴더들 무시
+country_classification_data_v1/
+ocr_train_data_v1/
+yolo_train_data_v1/
+malaysia/
+
+# OS 및 에디터 찌꺼기 파일
+.DS_Store
+.vscode/
+.cursor/

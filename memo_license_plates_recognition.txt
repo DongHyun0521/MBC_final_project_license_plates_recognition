@@ -1,0 +1,153 @@
+
+1. 번호판 탐지 (VOLOv11)
+2. 번호판 추출 문자열로 국가 구분
+3. 국가별 맞춤형 OCR 배정
+
+- 한국 번호판
+원천: 학습
+원천: 검증
+라벨: 학습
+라벨: 검증
+
+- 중국 번호판
+ccpd_base: 가장 기본적이고 화질이 선명하며 똑바로 찍힌 정상적인 번호판 사진들입니다. (약 20만 장)
+커리큘럼 러닝 (잘 나온거 먼저 학습, 못 나온거 나중에 학습)
+ccpd_blur / ccpd_weather: 흔들려서 흐릿하거나(blur), 비/눈이 오는 악천후(weather)에 찍힌 사진들입니다.
+ccpd_tilt / ccpd_rotate: 카메라가 삐뚤어지거나 심하게 회전된 사진들입니다.
+ccpd_challenge / ccpd_db: 역광이거나 그림자가 져서 극도로 어두운/밝은(db) 극한의 난이도입니다.
+ccpd_np: 번호판이 아예 없는(No Plate) 자동차 사진입니다.
+
+
+
+==================================================
+
+
+1. pip install fastapi uvicorn python-multipart opencv-python numpy easyocr paddlepaddle paddleocr
+2. 오른쪽 아래 3.14.0 클릭 -> 3.10.11 선택
+
+
+
+
+- 파이썬 3.10 사용
+로컬: .\.venv\Scripts\activate
+라이브러리 설치: pip install fastapi uvicorn python-multipart opencv-python numpy easyocr paddlepaddle paddleocr
+
+- PaddleOCR
+pip uninstall paddlepaddle -y
+pip install paddlepaddle==2.6.2
+
+- PaddleX
+pip uninstall paddleocr paddlex -y
+pip install paddleocr==2.8.1
+
+- OpenCV
+pip install opencv-python numpy
+
+
+
+==================================================
+
+
+
+모델1: YOLOv11 - 사진에서 번호판이 어디 있는지 찾기
+ㄴyolo_train_data_v1
+   ㄴimage : 나라 상관없이 yolo 사진들만
+   ㄴlabels : 나라 상관없이 yolo txt파일들만
+
+모델2: ResNet, MobileNet, EfficientNet 등 (가벼운 이미지 분류 모델) - 어느 나라 번호판인지 판별하기
+ㄴcountry_classification_data_v1
+   ㄴtrain
+      ㄴbrazil : ocr_train 내 crop이미지들만 (폴더명이 정답)
+      ㄴchina : ocr_train 내 crop이미지들만 (폴더명이 정답)
+      ㄴeurope : ocr_train 내 crop이미지들만 (폴더명이 정답)
+      ㄴindia : ocr_train 내 crop이미지들만 (폴더명이 정답)
+      ㄴkorea : ocr_train 내 crop이미지들만 (폴더명이 정답)
+   ㄴval
+      ㄴbrazil : ocr_val 내 crop이미지들만 (폴더명이 정답)
+      ㄴchina : ocr_val 내 crop이미지들만 (폴더명이 정답)
+      ㄴeurope : ocr_val 내 crop이미지들만 (폴더명이 정답)
+      ㄴindia : ocr_val 내 crop이미지들만 (폴더명이 정답)
+      ㄴkorea : ocr_val 내 crop이미지들만 (폴더명이 정답)
+
+모델3: PaddleOCR_korea - 한국 번호판 텍스트 읽어내기
+모델4: PaddleOCR_china - 중국 번호판 텍스트 읽어내기
+모델5: PaddleOCR_brazil - 브라질 번호판 텍스트 읽어내기
+모델6: PaddleOCR_malaysia - 말레이시아 번호판 텍스트 읽어내기
+모델7: PaddleOCR_uerope - 유럽 번호판 텍스트 읽어내기
+모델8: PaddleOCR_india - 인도 번호판 텍스트 읽어내기
+ㄴocr_train_data_v1
+   ㄴbrazil : ocr_dataset, ocr_train, ocr_val
+   ㄴchina : ocr_dataset, ocr_train, ocr_val
+   ㄴeurope : ocr_dataset, ocr_train, ocr_val
+   ㄴindia : ocr_dataset, ocr_train, ocr_val
+   ㄴkorea : ocr_dataset, ocr_train, ocr_val
+
+
+
+- 국가별 번호판
+한국: 한국어
+중국: 중국어 간체
+브라질: 포르투갈어
+말레이시아: 말레이어/영어
+미국: X (미국 주 판별용 번호판 데이터셋)
+유럽: 영어
+스페인: 스페인어
+인도: 힌디어/영어 (338장의 사진에서 자동차 521대가 여러번 촬영됨)
+
+
+
+- YOLOv11 nano : train / val 데이터
+0. 학습 시 자동으로 학습:검증 8:2로 분리 (이미지 1장 당 label 파일 1개)
+
+1. 한국: 이미지가 이미 잘려져 있어서 YOLO 학습에 사용 불가
+2. 중국: 310,482장 ( china\yolo_dataset\images (.jpg 310,482장) | china\yolo_dataset\labels (.txt 310,482개) )
+3. 브라질: 4,500장 ( brazil\yolo_dataset\images (.jpg 4,500장) | brazil\yolo_dataset\labels (.txt 4,500개) )
+4. 말레이시아: AI PC 필요 (7,326장)
+5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
+6. 유럽: 이미지가 이미 잘려져 있어서 YOLO 학습에 사용 불가
+7. 스페인: 1,219장 ( spain\yolo_dataset\images (.jpg 1,219장) | spain\yolo_dataset\labels (.txt 1,219개) )
+8. 인도: 1,691장 ( india\yolo_dataset\images (.jpg 1,691장) | india\yolo_dataset\labels (.txt 1,691개) ) - 3장은 YOLO가 인식 가능 / OCR이 인식 불가
+9. only_yolo: only_yolo\yolo_dataset\images (.jpg 10,116장) | only_yolo\yolo_dataset\labels (.txt 10,116개) )
+
+
+
+- PaddleOCR : train 데이터
+0. 학습 시 자동 데이터 분리 불가능 (전체 이미지에 label 파일 1개)
+
+1. 한국: 80,000장 ( korea\ocr_train (.jpg 80,000장) | korea\ocr_dataset\rec_gt_train.txt (80,000줄) )
+2. 중국: 248,295장 ( china\ocr_train (.jpg 248,295장) | china\ocr_dataset\rec_gt_train.txt (248,295줄) )
+3. 브라질: 3,600장 ( brazil\ocr_train (.jpg 3,600장) | brazil\ocr_dataset\rec_gt_train.txt (3,600줄) )
+4. 말레이시아: AI PC 필요 (7,326장)
+5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
+6. 유럽: 588장 ( europe\ocr_train (.png 588장) | europe\ocr_dataset\rec_gt_train.txt (588줄) )
+7. 스페인: 번호판마다 2자리씩 랜덤 블러 처리 -> OCR에 사용 불가
+8. 인도: 1,348장 ( india\ocr_train (.jpg 1,348장) | india\ocr_dataset\rec_gt_train.txt (1,348줄) )
+9. only_yolo: 번호판 정답 텍스트가 없음 -> OCR에 사용 불가
+
+
+
+- PaddleOCR : val 데이터
+0. 학습 시 자동 데이터 분리 불가능 (전체 이미지에 label 파일 1개)
+
+1. 한국: 10,000장 ( korea\ocr_val (.jpg 10,000장) | korea\ocr_dataset\rec_gt_val.txt (10,000줄) )
+2. 중국: 62,187장 ( china\ocr_val (.jpg 62,187장) | china\ocr_dataset\rec_gt_val.txt 62,187줄) )
+3. 브라질: 900장 ( brazil\ocr_val (.jpg 900장) | brazil\ocr_dataset\rec_gt_val.txt (900줄) )
+4. 말레이시아: AI PC 필요 (7,326장)
+5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
+6. 유럽: 146장 ( europe\ocr_val (.png 146장) | europe\ocr_dataset\rec_gt_val.txt (146줄) )
+7. 스페인: 번호판마다 2자리씩 블러 처리 -> OCR에 사용 불가
+8. 인도: 340장 ( india\ocr_val (.jpg 340장) | india\ocr_dataset\rec_gt_val.txt (340줄) )
+9. only_yolo: 번호판 정답 텍스트가 없음 -> OCR에 사용 불가
+
+
+
+==================================================
+
+
+
+PaddleOCR의 공식규격 : csv가 아닌 탭으로 구분된 txt
+
+번호판 정규식 바꿔야 하나?
+유럽, 인도 등 번호판 데이터 상대적으로 적은거: 가중치 부여, 데이터 증강 사용 예정
+
+

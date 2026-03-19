@@ -11,6 +11,7 @@ __pycache__/
 country_classification_data_v1/
 ocr_train_data_v1/
 yolo_train_data_v1/
+korea_addition/
 malaysia/
 
 # OS 및 에디터 찌꺼기 파일

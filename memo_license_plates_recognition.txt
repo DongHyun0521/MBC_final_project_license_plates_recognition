@@ -151,3 +151,50 @@ PaddleOCR의 공식규격 : csv가 아닌 탭으로 구분된 txt
 유럽, 인도 등 번호판 데이터 상대적으로 적은거: 가중치 부여, 데이터 증강 사용 예정
 
 
+
+
+
+==================================================
+
+
+
+-- 주차 기록
+CREATE TABLE parking_log (
+    parking_log_id SERIAL PRIMARY KEY,					-- PK
+    vehicle_num VARCHAR(20) NOT NULL,					-- 차량 번호 (OCR 결과)
+    license_plate_country VARCHAR(10) DEFAULT 'KOR',	-- 국가코드 (한국KOR, 말레이시아MYS, 중국CHN, 브라질BRA 등)
+    is_ev_license_plate BOOLEAN DEFAULT FALSE,			-- 전기차(하늘색 번호판) 여부
+    entry_time TIMESTAMP NOT NULL DEFAULT now(),		-- 주차 시작 시간
+    exit_time TIMESTAMP,								-- 주차 종료 시간
+    is_member BOOLEAN NOT NULL DEFAULT FALSE,			-- 회원 여부
+    parking_fee INTEGER NOT NULL DEFAULT 0				-- 회원 여부에 따른 주차 요금
+);
+
+
+- parking_log 테이블 추가 사항
+OCR 예측 정확도
+국가 예측 정확도
+인식한 차량 사진
+차량 사진에서 YOLO로 잘라낸 번호판 사진
+
+관리자가 vehicle_num UPDATE 할 수 있는 기능 (업데이트 시 업데이트 한 사람의 emp_number 기록)
+
+회원/비회원 비율: 관리자 대시보드에서 정해진 기간(일 단위)대로 출력
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

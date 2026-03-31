@@ -132,4 +132,4 @@ async def read_license_plate(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run("ai_server:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("server_license_plates_recognition:app", host="0.0.0.0", port=8001, reload=True)

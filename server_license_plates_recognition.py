@@ -1,135 +1,217 @@
-# ai_server.py
-
-from fastapi import FastAPI, UploadFile, File
-from paddleocr import PaddleOCR
+import os
 import cv2
 import numpy as np
-import uvicorn
+import torch
+import torch.nn as nn
+from fastapi import FastAPI, UploadFile, File
+from ultralytics import YOLO
+from torchvision import models, transforms
+from paddleocr import PaddleOCR
+from PIL import Image
+import traceback
+import time
+import base64
+import re
 
-# 💡 6개국 언어 판별/라우팅 전문가 호출!
-from plate_router import detect_country_and_route
+os.environ['FLAGS_enable_pir_api'] = '0'
 
-app = FastAPI(title="🚗 글로벌 6개국 차량 번호판 인식 AI 서버 (PaddleOCR 단독)")
+app = FastAPI()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+YOLO_PATH = os.path.join(BASE_DIR, 'finetuned_yolo11n_acc822.pt')
+EFF_PATH = os.path.join(BASE_DIR, 'finetuned_efficientnetb0.pt')
 
-print("======================================")
-print("🤖 AI 뇌(PaddleOCR) 로딩 중...")
-# 참고: 중국어 테스트 시 lang='ch'로 변경해야 한자를 잘 읽습니다. (기본은 한국어/영어 최적화)
-ocr = PaddleOCR(lang='korean', enable_mkldnn=False)
-print("✅ AI 서버 세팅 완료! (프론트엔드 연동 대기 중)")
-print("======================================")
+yolo_model = YOLO(YOLO_PATH)
+classify_model = models.efficientnet_b0()
+classify_model.classifier[1] = nn.Linear(classify_model.classifier[1].in_features, 5)
+classify_model.load_state_dict(torch.load(EFF_PATH, map_location=device))
+classify_model.to(device).eval()
 
-# 💡 전기차 판별 함수 (파란색 픽셀 비율 분석)
-def detect_ev_plate(img, box):
-    if box is None: return False
-    pts = np.array(box, dtype=np.int32)
-    x, y, w, h = cv2.boundingRect(pts)
-    padding = 10
-    
-    # 이미지 밖으로 넘어가지 않게 좌표 보정
-    x, y = max(0, x - padding), max(0, y - padding)
-    w = min(img.shape[1] - x, w + padding * 2)
-    h = min(img.shape[0] - y, h + padding * 2)
-    
-    plate_crop = img[y:y + h, x:x + w]
-    if plate_crop.size == 0: return False
-    
-    hsv = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2HSV)
-    lower_blue, upper_blue = np.array([85, 50, 50]), np.array([115, 255, 255])
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
-    return bool((cv2.countNonZero(mask) / (w * h)) > 0.15)
+COUNTRY_MAP = {0: 'BRA', 1: 'CHN', 2: 'EUR', 3: 'IND', 4: 'KOR'}
 
+# 국가별 OCR 언어 매핑
+COUNTRY_LANG_MAP = {
+    'KOR': 'korean',
+    'CHN': 'ch',
+    'BRA': 'en',
+    'EUR': 'en',
+    'IND': 'en',
+}
 
-@app.post("/api/v1/ocr")
-async def read_license_plate(file: UploadFile = File(...)):
-    print(f"\n======================================")
-    print(f"📥 [요청 수신] 사진이 도착했습니다! (파일명: {file.filename})")
+# OCR 엔진 캐시 (최초 사용 시 로드)
+ocr_engines = {}
 
+def get_ocr_engine(lang):
+    if lang not in ocr_engines:
+        print(f"🔄 PaddleOCR ({lang}) 초기화 중...")
+        ocr_engines[lang] = PaddleOCR(use_textline_orientation=True, lang=lang, enable_mkldnn=False)
+    return ocr_engines[lang]
+
+# 한국어, 중국어 엔진 미리 로드
+get_ocr_engine('korean')
+get_ocr_engine('ch')
+
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+@app.post("/license-plates-recognition")
+async def predict_all(file: UploadFile = File(...)):
     try:
-        # 1. 프론트엔드에서 받은 사진을 OpenCV 배열로 변환
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if img is None:
-            return {"status": "error", "message": "이미지를 읽을 수 없습니다."}
+        if img is None: return {"status": "error", "message": "이미지 읽기 실패"}
 
-        # 2. PaddleOCR로 글자 추출
-        result = ocr.ocr(img)
+        t1 = time.time()
 
-        raw_text = ""
-        is_ev = False
-        box = None
-        
-        # 기본 응답값 세팅
-        final_plate = "인식실패"
-        country_code = "UNKNOWN"
-        language_code = "ko"
-        welcome_msg = "번호판 인식에 실패했습니다."
+        # 1. YOLO 검출
+        is_detected = False
+        plate_crop = img
+
+        results = yolo_model(img)
+        if len(results[0].boxes) > 0:
+            box = results[0].boxes[0]
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            plate_crop = img[y1:y2, x1:x2]
+            is_detected = True
+
+        if plate_crop.size == 0: 
+            plate_crop = img
+
+        t2 = time.time()
+
+        # 2. 국가 판별 (EfficientNet)
+        pil_plate = Image.fromarray(cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB))
+        input_tensor = preprocess(pil_plate).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = classify_model(input_tensor)
+            probs = torch.softmax(output, dim=1)
+            max_prob, max_idx = torch.max(probs, 1)
+            country_code = COUNTRY_MAP.get(max_idx.item(), 'KOR')
+            country_accuracy = round(float(max_prob.item()) * 100, 2)
+
+            t3 = time.time()
+
+            all_probs = probs[0].cpu().numpy()
+            country_ranking = sorted(
+                [(COUNTRY_MAP[i], round(float(all_probs[i]) * 100, 2)) for i in range(5)],
+                key=lambda x: x[1], reverse=True
+            )
+
+        # 3. 국가별 PaddleOCR
+                # 3. OCR로 국가 확정 (한글→KOR, 한자→CHN, 그 외→EfficientNet)
+        v_num, acc = ("Unknown", 0.0)
+        ocr_details = []
+        detect_method = 'EfficientNet'
 
         try:
-            # 3. 텍스트 및 좌표 추출 로직
-            if result and isinstance(result, list) and len(result) > 0 and result[0] is not None:
-                first_item = result[0]
+            ph, pw = plate_crop.shape[:2]
+            target_w = 480
+            scale = target_w / pw
+            plate_for_ocr = cv2.resize(plate_crop, (target_w, int(ph * scale)))
 
-                if isinstance(first_item, dict) and 'rec_texts' in first_item:
-                    rec_texts = first_item.get('rec_texts', [])
-                    if len(rec_texts) > 0:
-                        raw_text = "".join(rec_texts)
+            # 1단계: 한국어 OCR 우선 실행
+            ocr_engine = get_ocr_engine('korean')
+            ocr_res = ocr_engine.predict(plate_for_ocr)
 
-                    polys = first_item.get('rec_polys') or first_item.get('dt_polys')
-                    if polys is not None and len(polys) > 0:
-                        box = polys[0].tolist() if hasattr(polys[0], 'tolist') else polys[0]
+            kor_text = ''
+            if ocr_res and len(ocr_res) > 0:
+                r = ocr_res[0]
+                if 'rec_texts' in r and len(r['rec_texts']) > 0:
+                    kor_text = ''.join(r['rec_texts']).replace(' ', '')
 
-                elif isinstance(first_item, list):
-                    text_parts = []
-                    for line in first_item:
-                        if isinstance(line, (list, tuple)) and len(line) >= 2:
-                            if box is None: box = line[0]  
-                            t_data = line[1]
-                            if isinstance(t_data, (list, tuple)) and len(t_data) >= 1:
-                                text_parts.append(t_data[0])  
-                    raw_text = "".join(text_parts) 
-
-            # 4. 추출된 글자가 있다면 6개국 라우터(Router)로 넘김!
-            if raw_text:
-                raw_text = raw_text.replace(" ", "")
-                print(f"🔍 [AI 텍스트 추출 성공] : '{raw_text}'")
-                
-                # 전기차 파란색 비율 계산
-                if box is not None: is_ev = detect_ev_plate(img, box)
-                
-                # 라우터 호출하여 국가, 번호판, 언어 응답 받아오기
-                route_result = detect_country_and_route(raw_text)
-                country_code = route_result["country"]
-                final_plate = route_result["plate_number"]
-                language_code = route_result["language"]
-                welcome_msg = route_result["welcome_message"]
-                
+            if re.search(r'[가-힣]', kor_text):
+                # 한글 발견 → KOR 확정
+                country_code = 'KOR'
+                country_accuracy = 100.0
+                detect_method = '한글 감지'
             else:
-                print("🚨 텍스트 추출에 실패했습니다. (사진에 글자가 없거나 흐림)")
+                # 2단계: 중국어 OCR 실행
+                ocr_engine = get_ocr_engine('ch')
+                ocr_res = ocr_engine.predict(plate_for_ocr)
 
-        except Exception as parse_err:
-            print(f"⚠️ [파싱 에러]: {parse_err}")
+                chn_text = ''
+                if ocr_res and len(ocr_res) > 0:
+                    r = ocr_res[0]
+                    if 'rec_texts' in r and len(r['rec_texts']) > 0:
+                        chn_text = ''.join(r['rec_texts']).replace(' ', '')
 
-        # 서버 콘솔에 최종 결과 출력
-        print(f"✨ [판별 완료] 번호판: '{final_plate}' | 국가: {country_code} | 전기차: {is_ev}")
-        print(f"======================================\n")
+                if re.search(r'[\u4e00-\u9fff]', chn_text):
+                    # 한자 발견 → CHN 확정
+                    country_code = 'CHN'
+                    country_accuracy = 100.0
+                    detect_method = '한자 감지'
+                else:
+                    # 3단계: 한글도 한자도 없음 → EfficientNet 신뢰 (BRA/EUR/IND)
+                    ocr_engine = get_ocr_engine('en')
+                    ocr_res = ocr_engine.predict(plate_for_ocr)
 
-        # 5. 프론트엔드/자바로 쏴줄 6개국 지원 JSON
+            # OCR 결과 처리 (최종 ocr_res 사용)
+            if ocr_res and len(ocr_res) > 0:
+                result = ocr_res[0]
+                if 'rec_texts' in result and len(result['rec_texts']) > 0:
+                    texts = list(result['rec_texts'])
+                    scores = list(result['rec_scores'])
+
+                    if len(texts) > 1 and 'dt_polys' in result:
+                        polys = result['dt_polys']
+                        centers = []
+                        for poly in polys:
+                            pts = np.array(poly)
+                            cx = float(pts[:, 0].mean())
+                            cy = float(pts[:, 1].mean())
+                            centers.append((cy, cx))
+
+                        order = sorted(range(len(texts)), key=lambda i: centers[i])
+                        texts = [texts[i] for i in order]
+                        scores = [scores[i] for i in order]
+
+                    v_num = ''.join(texts).replace(' ', '')
+                    if not v_num:
+                        v_num = "Unknown"
+                        acc = 0.0
+                    else:
+                        acc = float(sum(scores) / len(scores)) * 100
+                        ocr_details = [(texts[i], round(scores[i] * 100, 2)) for i in range(min(3, len(texts)))]
+
+        except Exception as ocr_err:
+            print(f"⚠️ OCR 내부 오류 (무시하고 진행): {ocr_err}")
+
+        t4 = time.time()
+
+        _, plate_encoded = cv2.imencode('.jpg', plate_crop)
+        plate_base64 = base64.b64encode(plate_encoded).decode('utf-8')
+
+        print("===========================================================================")
+        print(f"국가 : {country_code} ({country_accuracy}%) [{detect_method}]")
+        for i, (c, p) in enumerate(country_ranking[:3]):
+            print(f"  {i+1}. {c} ({p}%)")
+        print(f"번호 : {v_num} ({round(acc, 2)}%)")
+        print(f"YOLO 감지 여부 : {is_detected}")
+        print(f"⏱️ YOLO: {t2-t1:.3f}초 | EfficientNet: {t3-t2:.3f}초 | PaddleOCR: {t4-t3:.3f}초 | 합계: {t4-t1:.3f}초")
+        print("===========================================================================")
+    
         return {
             "status": "success",
-            "filename": file.filename,
-            "plate_number": final_plate,
-            "country": country_code,
-            "is_ev": is_ev,
-            "language": language_code,
-            "welcome_message": welcome_msg
+            "is_yolo_detected": is_detected,
+            "license_plate_country": country_code,
+            "country_accuracy": country_accuracy,
+            "vehicle_num": v_num,
+            "ocr_accuracy": round(acc, 2),
+            "is_ev_license_plate": False,
+            "plate_img_base64": plate_base64
         }
 
     except Exception as e:
-        print(f"🚨 [파이썬 서버 에러]: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        print(f"❌ 전체 프로세스 에러 발생!")
+        traceback.print_exc()
+        return {"status": "error", "message": f"AI 서버 상세 오류: {str(e)}"}
 
 if __name__ == "__main__":
-    uvicorn.run("server_license_plates_recognition:app", host="0.0.0.0", port=8001, reload=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -1,15 +1,9 @@
 
 1. 번호판 탐지 (VOLOv11)
-2. 번호판 추출 문자열로 국가 구분
-3. 국가별 맞춤형 OCR 배정
+2. 번호판 추출 문자열로 국가 구분 (EfficientNet)
+3. 국가별 맞춤형 OCR 배정 (PaddleOCR)
 
-- 한국 번호판
-원천: 학습
-원천: 검증
-라벨: 학습
-라벨: 검증
-
-- 중국 번호판
+- ccpd2019
 ccpd_base: 가장 기본적이고 화질이 선명하며 똑바로 찍힌 정상적인 번호판 사진들입니다. (약 20만 장)
 커리큘럼 러닝 (잘 나온거 먼저 학습, 못 나온거 나중에 학습)
 ccpd_blur / ccpd_weather: 흔들려서 흐릿하거나(blur), 비/눈이 오는 악천후(weather)에 찍힌 사진들입니다.
@@ -47,140 +41,196 @@ pip install opencv-python numpy
 
 
 
-모델1: YOLOv11 - 사진에서 번호판이 어디 있는지 찾기
-ㄴyolo_train_data_v1
-   ㄴimage : 나라 상관없이 yolo 사진들만
-   ㄴlabels : 나라 상관없이 yolo txt파일들만
+모델1: finetuned_yolo11n_acc822.pt - 사진에서 번호판이 어디 있는지 찾기
+ㄴyolo_train_data_v1 (중국, 브라질, 스페인, 인도, only_yolo)
+   ㄴimage : 나라 상관없이 yolo 사진들만 (328,008)
+   ㄴlabels : 나라 상관없이 yolo txt파일들만 (328,008)
 
-모델2: ResNet, MobileNet, EfficientNet 등 (가벼운 이미지 분류 모델) - 어느 나라 번호판인지 판별하기
+모델2: finetuned_efficientnetb0.pt - 어느 나라 번호판인지 판별하기
 ㄴcountry_classification_data_v1
-   ㄴtrain
-      ㄴbrazil : ocr_train 내 crop이미지들만 (폴더명이 정답)
-      ㄴchina : ocr_train 내 crop이미지들만 (폴더명이 정답)
-      ㄴeurope : ocr_train 내 crop이미지들만 (폴더명이 정답)
-      ㄴindia : ocr_train 내 crop이미지들만 (폴더명이 정답)
-      ㄴkorea : ocr_train 내 crop이미지들만 (폴더명이 정답)
-   ㄴval
-      ㄴbrazil : ocr_val 내 crop이미지들만 (폴더명이 정답)
-      ㄴchina : ocr_val 내 crop이미지들만 (폴더명이 정답)
-      ㄴeurope : ocr_val 내 crop이미지들만 (폴더명이 정답)
-      ㄴindia : ocr_val 내 crop이미지들만 (폴더명이 정답)
-      ㄴkorea : ocr_val 내 crop이미지들만 (폴더명이 정답)
+   ㄴtrain (폴더명이 정답)
+      ㄴbrazil : ocr_train 내 crop이미지들만 (3,600)
+      ㄴchina : ocr_train 내 crop이미지들만 (248,295)
+      ㄴeurope : ocr_train 내 crop이미지들만 (588)
+      ㄴindia : ocr_train 내 crop이미지들만 (1,348)
+      ㄴkorea : ocr_train 내 crop이미지들만 (80,000)
+   ㄴval (폴더명이 정답)
+      ㄴbrazil : ocr_val 내 crop이미지들만 (900)
+      ㄴchina : ocr_val 내 crop이미지들만 (62,187)
+      ㄴeurope : ocr_val 내 crop이미지들만 (146)
+      ㄴindia : ocr_val 내 crop이미지들만 (340)
+      ㄴkorea : ocr_val 내 crop이미지들만 (10,000)
 
-모델3: PaddleOCR_korea - 한국 번호판 텍스트 읽어내기
-모델4: PaddleOCR_china - 중국 번호판 텍스트 읽어내기
-모델5: PaddleOCR_brazil - 브라질 번호판 텍스트 읽어내기
-모델6: PaddleOCR_malaysia - 말레이시아 번호판 텍스트 읽어내기
-모델7: PaddleOCR_uerope - 유럽 번호판 텍스트 읽어내기
-모델8: PaddleOCR_india - 인도 번호판 텍스트 읽어내기
+모델3: PaddleOCR_brazil - 브라질 번호판 텍스트 읽어내기 (포르투갈어)
+모델4: PaddleOCR_china - 중국 번호판 텍스트 읽어내기 (한자)
+모델5: PaddleOCR_uerope - 유럽 번호판 텍스트 읽어내기 (영어)
+모델6: PaddleOCR_india - 인도 번호판 텍스트 읽어내기 (힌디어)
+모델7: PaddleOCR_korea - 한국 번호판 텍스트 읽어내기 (한글)
 ㄴocr_train_data_v1
-   ㄴbrazil : ocr_dataset, ocr_train, ocr_val
-   ㄴchina : ocr_dataset, ocr_train, ocr_val
-   ㄴeurope : ocr_dataset, ocr_train, ocr_val
-   ㄴindia : ocr_dataset, ocr_train, ocr_val
-   ㄴkorea : ocr_dataset, ocr_train, ocr_val
-
-
-
-- 국가별 번호판
-한국: 한국어
-중국: 중국어 간체
-브라질: 포르투갈어
-말레이시아: 말레이어/영어
-미국: X (미국 주 판별용 번호판 데이터셋)
-유럽: 영어
-스페인: 스페인어
-인도: 힌디어/영어 (338장의 사진에서 자동차 521대가 여러번 촬영됨)
-
-
-
-- YOLOv11 nano : train / val 데이터
-0. 학습 시 자동으로 학습:검증 8:2로 분리 (이미지 1장 당 label 파일 1개)
-
-1. 한국: 이미지가 이미 잘려져 있어서 YOLO 학습에 사용 불가
-2. 중국: 310,482장 ( china\yolo_dataset\images (.jpg 310,482장) | china\yolo_dataset\labels (.txt 310,482개) )
-3. 브라질: 4,500장 ( brazil\yolo_dataset\images (.jpg 4,500장) | brazil\yolo_dataset\labels (.txt 4,500개) )
-4. 말레이시아: AI PC 필요 (7,326장)
-5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
-6. 유럽: 이미지가 이미 잘려져 있어서 YOLO 학습에 사용 불가
-7. 스페인: 1,219장 ( spain\yolo_dataset\images (.jpg 1,219장) | spain\yolo_dataset\labels (.txt 1,219개) )
-8. 인도: 1,691장 ( india\yolo_dataset\images (.jpg 1,691장) | india\yolo_dataset\labels (.txt 1,691개) ) - 3장은 YOLO가 인식 가능 / OCR이 인식 불가
-9. only_yolo: only_yolo\yolo_dataset\images (.jpg 10,116장) | only_yolo\yolo_dataset\labels (.txt 10,116개) )
-
-
-
-- PaddleOCR : train 데이터
-0. 학습 시 자동 데이터 분리 불가능 (전체 이미지에 label 파일 1개)
-
-1. 한국: 80,000장 ( korea\ocr_train (.jpg 80,000장) | korea\ocr_dataset\rec_gt_train.txt (80,000줄) )
-2. 중국: 248,295장 ( china\ocr_train (.jpg 248,295장) | china\ocr_dataset\rec_gt_train.txt (248,295줄) )
-3. 브라질: 3,600장 ( brazil\ocr_train (.jpg 3,600장) | brazil\ocr_dataset\rec_gt_train.txt (3,600줄) )
-4. 말레이시아: AI PC 필요 (7,326장)
-5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
-6. 유럽: 588장 ( europe\ocr_train (.png 588장) | europe\ocr_dataset\rec_gt_train.txt (588줄) )
-7. 스페인: 번호판마다 2자리씩 랜덤 블러 처리 -> OCR에 사용 불가
-8. 인도: 1,348장 ( india\ocr_train (.jpg 1,348장) | india\ocr_dataset\rec_gt_train.txt (1,348줄) )
-9. only_yolo: 번호판 정답 텍스트가 없음 -> OCR에 사용 불가
-
-
-
-- PaddleOCR : val 데이터
-0. 학습 시 자동 데이터 분리 불가능 (전체 이미지에 label 파일 1개)
-
-1. 한국: 10,000장 ( korea\ocr_val (.jpg 10,000장) | korea\ocr_dataset\rec_gt_val.txt (10,000줄) )
-2. 중국: 62,187장 ( china\ocr_val (.jpg 62,187장) | china\ocr_dataset\rec_gt_val.txt 62,187줄) )
-3. 브라질: 900장 ( brazil\ocr_val (.jpg 900장) | brazil\ocr_dataset\rec_gt_val.txt (900줄) )
-4. 말레이시아: AI PC 필요 (7,326장)
-5. 미국: 미국 주 구별용 번호판 데이터셋이라서 사용 불가
-6. 유럽: 146장 ( europe\ocr_val (.png 146장) | europe\ocr_dataset\rec_gt_val.txt (146줄) )
-7. 스페인: 번호판마다 2자리씩 블러 처리 -> OCR에 사용 불가
-8. 인도: 340장 ( india\ocr_val (.jpg 340장) | india\ocr_dataset\rec_gt_val.txt (340줄) )
-9. only_yolo: 번호판 정답 텍스트가 없음 -> OCR에 사용 불가
-
-
-
-==================================================
-
-
+   ㄴbrazil
+      ㄴocr_dataset (3,600 / 900)
+      ㄴocr_train (3,600)
+      ㄴocr_val (900)
+   ㄴchina
+      ㄴocr_dataset (248,295 / 62,187)
+      ㄴocr_train (248,295)
+      ㄴocr_val (62,187)
+   ㄴeurope
+      ㄴocr_dataset (588 / 146)
+      ㄴocr_train (588)
+      ㄴocr_val (146)
+   ㄴindia
+      ㄴocr_dataset (1,348 / 340)
+      ㄴocr_train (1,348)
+      ㄴocr_val (340)
+   ㄴkorea
+      ㄴocr_dataset (80,000 / 10,000)
+      ㄴocr_train (80,000)
+      ㄴocr_val (10,000)
 
 PaddleOCR의 공식규격 : csv가 아닌 탭으로 구분된 txt
 
-번호판 정규식 바꿔야 하나?
-유럽, 인도 등 번호판 데이터 상대적으로 적은거: 가중치 부여, 데이터 증강 사용 예정
+미국 : 주 판별용 번호판 데이터셋
+스페인 : 번호판 두자리 랜덤 블러 처리
+only_yolo : 어느나라 번호판인지 모름
+말레이시아 : 크롭 전 이미지, 좌표 없음, 파일명이 OCR 정답
+한국(추가) : 크롭 전 이미지, 좌표 없음, 파일명이 OCR 정답
 
+인도 : 338장의 사진에서 자동차 521대가 여러번 촬영됨
 
-
+유럽, 인도 등 번호판 데이터 상대적으로 적은 데이터셋 : 가중치 부여 및 데이터 증강 사용 예정
 
 
 
 ==================================================
 
 
-
--- 주차 기록
-CREATE TABLE parking_log (
-    parking_log_id SERIAL PRIMARY KEY,					-- PK
-    vehicle_num VARCHAR(20) NOT NULL,					-- 차량 번호 (OCR 결과)
-    license_plate_country VARCHAR(10) DEFAULT 'KOR',	-- 국가코드 (한국KOR, 말레이시아MYS, 중국CHN, 브라질BRA 등)
-    is_ev_license_plate BOOLEAN DEFAULT FALSE,			-- 전기차(하늘색 번호판) 여부
-    entry_time TIMESTAMP NOT NULL DEFAULT now(),		-- 주차 시작 시간
-    exit_time TIMESTAMP,								-- 주차 종료 시간
-    is_member BOOLEAN NOT NULL DEFAULT FALSE,			-- 회원 여부
-    parking_fee INTEGER NOT NULL DEFAULT 0				-- 회원 여부에 따른 주차 요금
-);
-
-
-- parking_log 테이블 추가 사항
-OCR 예측 정확도
-국가 예측 정확도
-인식한 차량 사진
-차량 사진에서 YOLO로 잘라낸 번호판 사진
-
-관리자가 vehicle_num UPDATE 할 수 있는 기능 (업데이트 시 업데이트 한 사람의 emp_number 기록)
 
 입차한 회원/비회원 차량 비율: 관리자 대시보드에서 정해진 기간(일 단위)대로 출력
 평균 주차 시간 (예약을 하고 병원을 온 사람/예약을 안하고 병원을 온 사람) : 관리자 대시보드에서 정해진 기간(일 단위)대로 출력
 진료 예약 몇 분 전에 입차를 하는지에 대한 평균 시간 : 관리자 대시보드에서 정해진 기간(일 단위)대로 출력
+
+
+
+==================================================
+
+
+
+- yolo 11 nano
+배치: 16
+옵티마이저: 오토
+
+- yolo 11 nano
+배치: 8
+옵티마이저: 오토
+
+- yolo 11 small
+배치: 8
+옵티마이저: 오토
+
+- yolo 11 nano
+배치: 16
+옵티마이저: 아담W
+
+
+
+==================================================
+
+
+
+- Efficientnet_B0
+Epoch 1/50 | val Acc: 0.997872
+Epoch 2/50 | val Acc: 0.999588
+Epoch 3/50 | val Acc: 0.999791
+Epoch 4/50 | val Acc: 0.999694
+Epoch 5/50 | val Acc: 0.999595
+Epoch 6/50 | val Acc: 0.999895
+Epoch 7/50 | val Acc: 0.999596
+Epoch 8/50 | val Acc: 0.999697
+Epoch 9/50 | val Acc: 0.999897
+Epoch 10/50 | val Acc: 0.999897
+Epoch 11/50 | val Acc: 0.999897
+Epoch 12/50 | val Acc: 0.999997
+Epoch 13/50 | val Acc: 0.999698
+Epoch 14/50 | val Acc: 0.999898
+Epoch 15/50 | val Acc: 0.999898
+Epoch 16/50 | val Acc: 0.999898
+Epoch 17/50 | val Acc: 0.999998
+Epoch 18/50 | val Acc: 0.999998
+Epoch 19/50 | val Acc: 0.999898
+Epoch 20/50 | val Acc: 0.999898
+Epoch 21/50 | val Acc: 0.999798
+Epoch 22/50 | val Acc: 0.999798
+Epoch 23/50 | val Acc: 0.999898
+Epoch 24/50 | val Acc: 0.999799
+ 조기 종료! (최고 정확도: 0.9999)
+
+✅ efficientnet_b0 실험 완료! 최고 정확도: 0.9999
+
+
+
+- MOBILENET_V3
+Epoch 1/50 | val Acc: 0.998567
+Epoch 2/50 | val Acc: 0.998686
+Epoch 3/50 | val Acc: 0.998590
+Epoch 4/50 | val Acc: 0.999492
+Epoch 5/50 | val Acc: 0.999793
+Epoch 6/50 | val Acc: 0.999795
+Epoch 7/50 | val Acc: 0.999695
+Epoch 8/50 | val Acc: 0.999896
+Epoch 9/50 | val Acc: 0.999596
+Epoch 10/50 | val Acc: 0.999197
+Epoch 11/50 | val Acc: 0.999696
+Epoch 12/50 | val Acc: 0.999897
+Epoch 13/50 | val Acc: 0.999897
+Epoch 14/50 | val Acc: 0.999797
+Epoch 15/50 | val Acc: 0.999797
+Epoch 16/50 | val Acc: 0.999597
+Epoch 17/50 | val Acc: 0.999698
+Epoch 18/50 | val Acc: 0.999498
+Epoch 19/50 | val Acc: 0.999798
+Epoch 20/50 | val Acc: 0.999798
+ 조기 종료! (최고 정확도: 0.9998)
+
+✅ mobilenet_v3 실험 완료! 최고 정확도: 0.9998
+
+
+
+- RESNET18
+Epoch 1/50 | val Acc: 0.997056
+Epoch 2/50 | val Acc: 0.999386
+Epoch 3/50 | val Acc: 0.999391
+Epoch 4/50 | val Acc: 0.999493
+Epoch 5/50 | val Acc: 0.999795
+Epoch 6/50 | val Acc: 0.999796
+Epoch 7/50 | val Acc: 0.999897
+Epoch 8/50 | val Acc: 0.999797
+Epoch 9/50 | val Acc: 0.999798
+Epoch 10/50 | val Acc: 0.999898
+Epoch 11/50 | val Acc: 0.999398
+Epoch 12/50 | val Acc: 0.999798
+Epoch 13/50 | val Acc: 0.999798
+Epoch 14/50 | val Acc: 0.999799
+ 조기 종료! (최고 정확도: 0.9998)
+
+✅ resnet18 실험 완료! 최고 정확도: 0.9998
+
+
+
+==================================================
+
+
+
+PaddleOCR
+
+
+
+
+
+
+
+
+
 
 
 

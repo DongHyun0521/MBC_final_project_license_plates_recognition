@@ -22,4 +22,5 @@ malaysia/
 .cursor/
 
 # 파인튜닝 AI 모델들
-.pt
+*.pt
+*.pth

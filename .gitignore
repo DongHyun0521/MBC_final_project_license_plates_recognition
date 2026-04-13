@@ -9,12 +9,17 @@ __pycache__/
 *$py.class
 
 # 원본 데이터 폴더들 무시
+PaddleOCR/
 country_classification_data_v1/
 ocr_train_data_v1/
 yolo_train_data_v1/
+
 korea_addition/
 malaysia/
-01_baseline_11n_640/
+
+finetuned_models/
+
+demo_images/
 
 # OS 및 에디터 찌꺼기 파일
 .DS_Store

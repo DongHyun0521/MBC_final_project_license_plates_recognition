@@ -1,15 +1,13 @@
 import os
+import re
 import cv2
 import math
 import numpy as np
-import torch
-import torch.nn as nn
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File
 from contextlib import asynccontextmanager
 from ultralytics import YOLO
-from torchvision import models, transforms
-from PIL import Image
 import paddle.inference as pdi
 import onnxruntime as ort
 import traceback
@@ -37,32 +35,46 @@ COUNTRY_MODEL_MAP = {
     'IND': os.path.join(BASE_DIR, 'finetuned_models', 'paddle_ocr', 'inference_v2', 'rec_india_aug'),
 }
 
-# character dict도 같은 폴더의 inference.yml에서 읽기
+# ─── 국가별 번호판 정규식 ────────────────────────────────────────
+# KOR: 숫자2~3 + 한글1 + 숫자4          예) 12가3456 / 123가4567
+#      한글2~4 + 숫자2 + 한글1 + 숫자4   예) 충북88아1511 / 인천연수나2733 / 서울12가3456
+# CHN: 한자1 + 영문1 + 영숫자5   예) 皖AJ9T46
+# BRA: 영문3 + 숫자4             예) ABC1234  (구형)
+#      영문3 + 숫자1 + 영문1 + 숫자2  예) ABC1D23 (메르코술)
+# EUR: 영숫자 4~10자 (국가마다 상이, 느슨하게 적용)
+# IND: 영문2 + 숫자2 + 영문1~3 + 숫자4  예) MH12AB1234
+COUNTRY_REGEX = {
+    'KOR': re.compile(r'^(([가-힣]{2,4}\d{0,3})|(\d{2,3}))[가-힣]\d{4}$'),
+    'CHN': re.compile(r'^[\u4e00-\u9fff][A-Z][A-Z0-9]{5}$'),
+    'BRA': re.compile(r'^[A-Z]{3}\d{4}$|^[A-Z]{3}\d[A-Z]\d{2}$'),
+    'EUR': re.compile(r'^[A-Z0-9]{4,10}$'),
+    'IND': re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$'),
+}
+
+def validate_plate(text, country_code):
+    """번호판 정규식 검증 → True/False"""
+    pattern = COUNTRY_REGEX.get(country_code)
+    if not pattern or not text:
+        return False
+    return bool(pattern.match(text.replace(' ', '').replace('-', '').upper()))
 
 # ─── YOLO 로드 ──────────────────────────────────────────────────
 yolo_model = YOLO(YOLO_PATH)
 
 # ─── EfficientNet 로드 ──────────────────────────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+eff_session    = ort.InferenceSession(EFF_ONNX_PATH, providers=['CPUExecutionProvider'])
+eff_input_name = eff_session.get_inputs()[0].name
+print(f"  EfficientNet ONNX: {EFF_ONNX_PATH}")
 
-if os.path.exists(EFF_ONNX_PATH):
-    eff_session    = ort.InferenceSession(EFF_ONNX_PATH, providers=['CPUExecutionProvider'])
-    eff_input_name = eff_session.get_inputs()[0].name
-    use_onnx_eff   = True
-    print(f"  EfficientNet ONNX: {EFF_ONNX_PATH}")
-else:
-    classify_model = models.efficientnet_b0()
-    classify_model.classifier[1] = nn.Linear(classify_model.classifier[1].in_features, 5)
-    classify_model.load_state_dict(torch.load(EFF_PT_PATH, map_location=device))
-    classify_model.to(device).eval()
-    use_onnx_eff = False
-    print(f"  EfficientNet PyTorch: {EFF_PT_PATH}")
+_EFF_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_EFF_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-eff_preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+def eff_preprocess(img_bgr):
+    """EfficientNet 전처리: resize → RGB → normalize → NCHW"""
+    img = cv2.resize(img_bgr, (224, 224))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    img = (img - _EFF_MEAN) / _EFF_STD
+    return img.transpose(2, 0, 1)[np.newaxis, :]  # HWC → NCHW
 
 # ─── PaddleOCR Recognition: Paddle Inference 직접 사용 ───────────
 rec_predictors = {}  # country_code -> predictor
@@ -127,24 +139,31 @@ def load_rec_predictor(country_code):
     n_chars = len(char_dicts[country_code])
     print(f"  PaddleOCR rec ({country_code}): {model_dir} ({n_chars} chars)")
 
+import threading
+
+_ocr_locks = {}  # country_code -> Lock
+
 def run_ocr(country_code, plate_img):
-    """단일 국가 OCR 실행 → (text, score)"""
+    """단일 국가 OCR 실행 → (text, score). Lock으로 thread-safe 보장."""
+    lock = _ocr_locks[country_code]
     predictor = rec_predictors[country_code]
     char_list = char_dicts[country_code]
 
     norm_img = resize_norm_img(plate_img)[np.newaxis, :]
 
-    input_handle = predictor.get_input_handle('x')
-    input_handle.reshape(norm_img.shape)
-    input_handle.copy_from_cpu(norm_img)
-    predictor.run()
+    with lock:
+        input_handle = predictor.get_input_handle('x')
+        input_handle.reshape(norm_img.shape)
+        input_handle.copy_from_cpu(norm_img)
+        predictor.run()
+        output = predictor.get_output_handle(predictor.get_output_names()[0]).copy_to_cpu()
 
-    output = predictor.get_output_handle(predictor.get_output_names()[0]).copy_to_cpu()
     return ctc_decode(output[0], char_list)
 
 # 5개국 모델 전부 미리 로드
 for code in COUNTRY_MODEL_MAP:
     load_rec_predictor(code)
+    _ocr_locks[code] = threading.Lock()
 
 # ─── 워밍업 & 서버 시작 ─────────────────────────────────────────
 @asynccontextmanager
@@ -160,13 +179,7 @@ async def lifespan(app: FastAPI):
         print(f"    YOLO 워밍업 실패: {e}")
 
     try:
-        pil_dummy = Image.fromarray(dummy)
-        tensor = eff_preprocess(pil_dummy).unsqueeze(0)
-        if use_onnx_eff:
-            eff_session.run(None, {eff_input_name: tensor.numpy()})
-        else:
-            with torch.no_grad():
-                classify_model(tensor.to(device))
+        eff_session.run(None, {eff_input_name: eff_preprocess(dummy_plate)})
         print("    EfficientNet 워밍업 완료")
     except Exception as e:
         print(f"    EfficientNet 워밍업 실패: {e}")
@@ -206,6 +219,12 @@ async def predict_all(file: UploadFile = File(...)):
         if len(results[0].boxes) > 0:
             box = results[0].boxes[0]
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            h_img, w_img = img.shape[:2]
+            pad = int((x2 - x1) * 0.03)  # 너비의 3% 패딩
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(w_img, x2 + pad)
+            y2 = min(h_img, y2 + pad)
             plate_crop = img[y1:y2, x1:x2]
             is_detected = True
 
@@ -215,73 +234,60 @@ async def predict_all(file: UploadFile = File(...)):
         t2 = time.time()
 
         # ── 2단계: EfficientNet 국가 분류 ──
-        pil_plate    = Image.fromarray(cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB))
-        input_tensor = eff_preprocess(pil_plate).unsqueeze(0)
-
-        if use_onnx_eff:
-            logits    = eff_session.run(None, {eff_input_name: input_tensor.numpy()})[0][0]
-            e         = np.exp(logits - logits.max())
-            all_probs = e / e.sum()
-            max_idx   = int(np.argmax(all_probs))
-            max_prob  = float(all_probs[max_idx])
-        else:
-            with torch.no_grad():
-                output    = classify_model(input_tensor.to(device))
-                probs_t   = torch.softmax(output, dim=1)
-                all_probs = probs_t[0].cpu().numpy()
-                max_idx   = int(np.argmax(all_probs))
-                max_prob  = float(all_probs[max_idx])
+        logits    = eff_session.run(None, {eff_input_name: eff_preprocess(plate_crop)})[0][0]
+        e         = np.exp(logits - logits.max())
+        all_probs = e / e.sum()
+        max_idx   = int(np.argmax(all_probs))
+        max_prob  = float(all_probs[max_idx])
 
         country_code     = COUNTRY_MAP.get(max_idx, 'KOR')
         country_accuracy = round(max_prob * 100, 2)
 
-        country_ranking = sorted(
-            [(COUNTRY_MAP[i], round(float(all_probs[i]) * 100, 2)) for i in range(5)],
-            key=lambda x: x[1], reverse=True
-        )
-
         t3 = time.time()
 
-        # ── 3단계: PaddleOCR Recognition ──
-        # 1) KOR 모델 → 한글 있으면 KOR 확정
-        # 2) CHN 모델 → 한자 있으면 CHN 확정
-        # 3) 둘 다 아니면 → EfficientNet 1위 국가(BRA/EUR/IND) 결과 사용
-        import re
-        v_num = "Unknown"
-        acc = 0.0
-        detect_method = "EfficientNet"
+        # ── 3단계: 5개국 OCR 병렬 실행 + 정규식 검증 ──
+        def ocr_worker(code):
+            text, score = run_ocr(code, plate_crop)
+            valid = validate_plate(text, code)
+            return (code, text, score, valid)
 
+        candidates = []
         try:
-            # 1) 한국어 모델
-            kor_text, kor_score = run_ocr('KOR', plate_crop)
-            if re.search(r'[가-힣]', kor_text) and kor_score > 0.3:
-                v_num = kor_text
-                acc = round(kor_score * 100, 2)
-                country_code = 'KOR'
-                country_accuracy = acc
-                detect_method = "한글 감지"
-            else:
-                # 2) 중국어 모델
-                chn_text, chn_score = run_ocr('CHN', plate_crop)
-                if re.search(r'[\u4e00-\u9fff]', chn_text) and chn_score > 0.3:
-                    v_num = chn_text
-                    acc = round(chn_score * 100, 2)
-                    country_code = 'CHN'
-                    country_accuracy = acc
-                    detect_method = "한자 감지"
-                else:
-                    # 3) BRA/EUR/IND → EfficientNet 1위 국가 사용
-                    for rank_country, rank_prob in country_ranking:
-                        if rank_country not in ('KOR', 'CHN'):
-                            text, score = run_ocr(rank_country, plate_crop)
-                            v_num = text
-                            acc = round(score * 100, 2)
-                            country_code = rank_country
-                            country_accuracy = rank_prob
-                            break
-
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                candidates = list(executor.map(ocr_worker, COUNTRY_MODEL_MAP.keys()))
         except Exception as ocr_err:
             print(f"  OCR 오류: {ocr_err}")
+
+        # 정규식 통과한 결과 중 OCR 점수 최고 선택
+        # EUR은 정규식이 느슨 → 다른 국가가 통과하면 EUR보다 우선
+        valid_results  = [(c, t, s) for c, t, s, v in candidates if v]
+        strict_results = [(c, t, s) for c, t, s in valid_results if c != 'EUR']
+        is_valid = False
+
+        if strict_results:
+            best = max(strict_results, key=lambda x: x[2])
+            country_code     = best[0]
+            v_num            = best[1]
+            acc              = round(best[2] * 100, 2)
+            country_accuracy = round(float(all_probs[list(COUNTRY_MAP.values()).index(country_code)]) * 100, 2)
+            is_valid         = True
+        elif valid_results:
+            best = max(valid_results, key=lambda x: x[2])
+            country_code     = best[0]
+            v_num            = best[1]
+            acc              = round(best[2] * 100, 2)
+            country_accuracy = round(float(all_probs[list(COUNTRY_MAP.values()).index(country_code)]) * 100, 2)
+            is_valid         = True
+        else:
+            # 정규식 통과 없음 → EfficientNet 1순위의 OCR 결과 사용
+            eff_country = COUNTRY_MAP.get(max_idx, 'KOR')
+            eff_result = next(((c, t, s) for c, t, s, v in candidates if c == eff_country), None)
+            if eff_result:
+                v_num = eff_result[1] or "Unknown"
+                acc   = round(eff_result[2] * 100, 2)
+            else:
+                v_num = "Unknown"
+                acc   = 0.0
 
         t4 = time.time()
 
@@ -290,8 +296,11 @@ async def predict_all(file: UploadFile = File(...)):
         plate_base64 = base64.b64encode(plate_encoded).decode('utf-8')
 
         print("===========================================================================")
-        print(f"국가 : {country_code} [{detect_method}]")
-        print(f"번호 : {v_num} ({acc}%)")
+        print(f"결과 : {country_code} | {v_num} ({acc}%) | 정규식: {'통과' if is_valid else '실패'}")
+        print(f"EFF  : {COUNTRY_MAP.get(max_idx)} ({round(max_prob*100,2)}%)")
+        for c, t, s, v in candidates:
+            mark = "→" if c == country_code else " "
+            print(f"  {mark} {c}: {t} ({round(s*100,2)}%) {'[정규식 통과]' if v else ''}")
         print(f"YOLO : {is_detected} | YOLO: {t2-t1:.3f}s | EfficientNet: {t3-t2:.3f}s | OCR: {t4-t3:.3f}s | 합계: {t4-t1:.3f}s")
         print("===========================================================================")
 

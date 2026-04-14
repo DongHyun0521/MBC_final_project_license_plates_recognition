@@ -8,24 +8,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# OS 및 에디터 찌꺼기 파일
+.DS_Store
+.vscode/
+.cursor/
+
 # 원본 데이터 폴더들 무시
 PaddleOCR/
 country_classification_data_v1/
 ocr_train_data_v1/
 yolo_train_data_v1/
 
+# 추가 데이터셋
 korea_addition/
 malaysia/
 
+# 파인튜닝 모델
 finetuned_models/
-
-demo_images/
-
-# OS 및 에디터 찌꺼기 파일
-.DS_Store
-.vscode/
-.cursor/
-
-# 파인튜닝 AI 모델들
-*.pt
-*.pth

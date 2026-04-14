@@ -3,19 +3,15 @@ import datetime
 from ultralytics import YOLO
 
 def run_overnight_experiments():
-    # 💡 8시간 밤샘용 4가지 실험 세팅
     experiments = [
-        # 실험 1: [기준점] 가장 기본 세팅
-        #{'exp_name': '01_baseline_11n_640', 'model': 'yolo11n.pt', 'imgsz': 640, 'batch': 16, 'optimizer': 'auto'},
-        
-        # 실험 2: [해상도 UP] 번호판은 작으니까 이미지를 더 크게 줘보자 (추천!)
-        {'exp_name': '02_highres_11n_800', 'model': 'yolo11n.pt', 'imgsz': 800, 'batch': 8, 'optimizer': 'auto'},
-        
-        # 실험 3: [모델 UP] 더 무겁고 똑똑한 Small 모델을 써보자
-        {'exp_name': '03_model_11s_640', 'model': 'yolo11s.pt', 'imgsz': 640, 'batch': 8, 'optimizer': 'auto'},
-        
-        # 실험 4: [옵티마이저 변경] 파인튜닝에 좋다는 AdamW를 써보자
-        {'exp_name': '04_adamw_11n_640', 'model': 'yolo11n.pt', 'imgsz': 640, 'batch': 16, 'optimizer': 'AdamW'}
+        # YOLO11s: 해상도 640, AdamW
+        {'exp_name': '01_11s_640_adamw', 'model': 'yolo11s.pt', 'imgsz': 640, 'batch': 8, 'optimizer': 'AdamW'},
+
+        # YOLO11s: 해상도 800, AdamW (번호판은 작으니 고해상도)
+        {'exp_name': '02_11s_800_adamw', 'model': 'yolo11s.pt', 'imgsz': 800, 'batch': 4, 'optimizer': 'AdamW'},
+
+        # YOLO11s: 해상도 640, SGD (비교용)
+        {'exp_name': '03_11s_640_sgd', 'model': 'yolo11s.pt', 'imgsz': 640, 'batch': 8, 'optimizer': 'SGD'},
     ]
 
     print("🌙 8시간 오버나이트 YOLO 파인튜닝 자동화를 시작합니다...")
@@ -37,7 +33,7 @@ def run_overnight_experiments():
             optimizer=exp['optimizer'], # 변경된 옵티마이저 적용
             project='Overnight_Experiments', 
             name=exp['exp_name'],  
-            device=1,
+            device=0,
             workers=0,
             exist_ok=True,
             plots=True

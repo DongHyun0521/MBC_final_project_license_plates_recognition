@@ -1,33 +1,43 @@
+"""
+다국적 자동차 번호판 인식 AI 서버 (port 8001)
+
+파이프라인: YOLO(번호판 검출) → EfficientNet(국가 분류) → PaddleOCR(문자 인식) → 정규식(검증)
+"""
 import os
 import re
 import cv2
 import math
+import threading
+import traceback
+import time
+import base64
+
 import numpy as np
 import yaml
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File
 from contextlib import asynccontextmanager
 from ultralytics import YOLO
 import paddle.inference as pdi
 import onnxruntime as ort
-import traceback
-import time
-import base64
 
 os.environ['FLAGS_enable_pir_api'] = '0'
 
-# ─── 모델 경로 설정 ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# 설정
+# ═══════════════════════════════════════════════════════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-ONNX_PATH     = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.onnx')
-PT_PATH       = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.pt')
-YOLO_PATH     = ONNX_PATH if os.path.exists(ONNX_PATH) else PT_PATH
-EFF_ONNX_PATH = os.path.join(BASE_DIR, 'finetuned_models', 'efficient_net', 'efficient_net_b0', 'finetuned_efficientnetb0.onnx')
-EFF_PT_PATH   = os.path.join(BASE_DIR, 'finetuned_models', 'efficient_net', 'efficient_net_b0', 'finetuned_efficientnetb0.pt')
+# 모델 경로
+YOLO_ONNX = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.onnx')
+YOLO_PT   = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.pt')
+YOLO_PATH = YOLO_ONNX if os.path.exists(YOLO_ONNX) else YOLO_PT
+EFF_PATH  = os.path.join(BASE_DIR, 'finetuned_models', 'efficient_net', 'efficient_net_b0', 'finetuned_efficientnetb0.onnx')
 
+# EfficientNet 출력 인덱스 → 국가코드
 COUNTRY_MAP = {0: 'BRA', 1: 'CHN', 2: 'EUR', 3: 'IND', 4: 'KOR'}
 
-COUNTRY_MODEL_MAP = {
+# 국가별 PaddleOCR 모델 디렉토리
+OCR_MODELS = {
     'KOR': os.path.join(BASE_DIR, 'finetuned_models', 'paddle_ocr', 'inference_v2', 'rec_korea'),
     'CHN': os.path.join(BASE_DIR, 'finetuned_models', 'paddle_ocr', 'inference_v2', 'rec_china'),
     'BRA': os.path.join(BASE_DIR, 'finetuned_models', 'paddle_ocr', 'inference_v2', 'rec_brazil'),
@@ -35,15 +45,10 @@ COUNTRY_MODEL_MAP = {
     'IND': os.path.join(BASE_DIR, 'finetuned_models', 'paddle_ocr', 'inference_v2', 'rec_india_aug'),
 }
 
-# ─── 국가별 번호판 정규식 ────────────────────────────────────────
-# KOR: 숫자2~3 + 한글1 + 숫자4          예) 12가3456 / 123가4567
-#      한글2~4 + 숫자2 + 한글1 + 숫자4   예) 충북88아1511 / 인천연수나2733 / 서울12가3456
-# CHN: 한자1 + 영문1 + 영숫자5   예) 皖AJ9T46
-# BRA: 영문3 + 숫자4             예) ABC1234  (구형)
-#      영문3 + 숫자1 + 영문1 + 숫자2  예) ABC1D23 (메르코술)
-# EUR: 영숫자 4~10자 (국가마다 상이, 느슨하게 적용)
-# IND: 영문2 + 숫자2 + 영문1~3 + 숫자4  예) MH12AB1234
-COUNTRY_REGEX = {
+# 국가별 번호판 정규식
+# KOR: 12가3456, 123가4567, 서울12가3456, 충북88아1511
+# CHN: 皖AJ9T46  BRA: ABC1234, ABC1D23  EUR: 영숫자 4~10자  IND: MH12AB1234
+PLATE_REGEX = {
     'KOR': re.compile(r'^(([가-힣]{2,4}\d{0,3})|(\d{2,3}))[가-힣]\d{4}$'),
     'CHN': re.compile(r'^[\u4e00-\u9fff][A-Z][A-Z0-9]{5}$'),
     'BRA': re.compile(r'^[A-Z]{3}\d{4}$|^[A-Z]{3}\d[A-Z]\d{2}$'),
@@ -51,74 +56,116 @@ COUNTRY_REGEX = {
     'IND': re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$'),
 }
 
+# EfficientNet ImageNet 정규화 상수
+_EFF_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_EFF_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# ═══════════════════════════════════════════════════════════════════
+# 전처리 / 디코딩 함수
+# ═══════════════════════════════════════════════════════════════════
 def validate_plate(text, country_code):
-    """번호판 정규식 검증 → True/False"""
-    pattern = COUNTRY_REGEX.get(country_code)
+    """번호판 텍스트가 해당 국가 정규식에 맞는지 검증"""
+    pattern = PLATE_REGEX.get(country_code)
     if not pattern or not text:
         return False
     return bool(pattern.match(text.replace(' ', '').replace('-', '').upper()))
 
-# ─── YOLO 로드 ──────────────────────────────────────────────────
-yolo_model = YOLO(YOLO_PATH)
-
-# ─── EfficientNet 로드 ──────────────────────────────────────────
-eff_session    = ort.InferenceSession(EFF_ONNX_PATH, providers=['CPUExecutionProvider'])
-eff_input_name = eff_session.get_inputs()[0].name
-print(f"  EfficientNet ONNX: {EFF_ONNX_PATH}")
-
-_EFF_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_EFF_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 def eff_preprocess(img_bgr):
-    """EfficientNet 전처리: resize → RGB → normalize → NCHW"""
+    """EfficientNet 입력 전처리: 224x224 리사이즈 → RGB → ImageNet 정규화 → NCHW"""
     img = cv2.resize(img_bgr, (224, 224))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     img = (img - _EFF_MEAN) / _EFF_STD
-    return img.transpose(2, 0, 1)[np.newaxis, :]  # HWC → NCHW
+    return img.transpose(2, 0, 1)[np.newaxis, :]
 
-# ─── PaddleOCR Recognition: Paddle Inference 직접 사용 ───────────
-rec_predictors = {}  # country_code -> predictor
-char_dicts = {}      # country_code -> ['blank', '-', '0', '1', ...]
 
-def resize_norm_img(img, image_shape=(3, 48, 320)):
-    """PaddleOCR 학습과 동일한 전처리: 종횡비 유지 + 우측 패딩"""
-    imgC, imgH, imgW = image_shape
+def ocr_preprocess(img, target_shape=(3, 48, 320)):
+    """PaddleOCR 입력 전처리: 종횡비 유지 리사이즈 + 우측 제로패딩"""
+    C, H, W = target_shape
     h, w = img.shape[:2]
-    ratio = w / float(h)
-    resized_w = min(imgW, int(math.ceil(imgH * ratio)))
-    resized_image = cv2.resize(img, (resized_w, imgH))
-    resized_image = resized_image.astype('float32').transpose((2, 0, 1)) / 255.0
-    resized_image -= 0.5
-    resized_image /= 0.5
-    padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
-    padding_im[:, :, :resized_w] = resized_image
-    return padding_im
+    resized_w = min(W, int(math.ceil(H * w / float(h))))
+    resized = cv2.resize(img, (resized_w, H)).astype('float32')
+    resized = resized.transpose((2, 0, 1)) / 255.0
+    resized = (resized - 0.5) / 0.5
+    padded = np.zeros((C, H, W), dtype=np.float32)
+    padded[:, :, :resized_w] = resized
+    return padded
 
-def ctc_decode(preds, char_list):
-    """CTC greedy decode: 연속 중복 제거 + blank(0) 제거"""
-    pred_indices = preds.argmax(axis=1)
-    chars = []
-    scores = []
-    prev = -1
-    for i, idx in enumerate(pred_indices):
-        if idx != prev and idx != 0 and idx < len(char_list):
-            chars.append(char_list[idx])
-            # softmax 확률 계산
-            row = preds[i]
-            if abs(row.sum() - 1.0) < 0.01:  # 이미 softmax된 경우
-                scores.append(float(row[idx]))
-            else:  # logits인 경우
-                e = np.exp(row - row.max())
-                scores.append(float(e[idx] / e.sum()))
-        prev = idx
-    text = ''.join(chars)
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    return text, avg_score
 
-def load_rec_predictor(country_code):
-    """Paddle Inference로 rec 모델 로드"""
-    model_dir = COUNTRY_MODEL_MAP[country_code]
+def _to_prob(preds):
+    """모델 출력을 softmax 확률로 변환 (이미 softmax면 그대로 반환)"""
+    if abs(preds[0].sum() - 1.0) < 0.01:
+        return preds
+    e = np.exp(preds - preds.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
 
+
+def ctc_beam_decode(preds, char_list, beam_width=5, top_n=3):
+    """CTC beam search 디코딩: 모델 출력에서 상위 N개 텍스트 후보 반환
+
+    greedy decode(1개)와 달리, 여러 후보를 뽑아 정규식 검증 기회를 넓힘.
+    예) 1순위 "12가345"(정규식 실패) → 2순위 "12가3456"(정규식 통과)
+    """
+    probs = _to_prob(preds)
+    T, C = probs.shape
+    BLANK = 0
+    beams = {((), BLANK): 0.0}
+
+    for t in range(T):
+        new_beams = {}
+        top_k = min(beam_width, C)
+        top_indices = np.argpartition(probs[t], -top_k)[-top_k:]
+
+        for (prefix, last), log_p in beams.items():
+            for idx in top_indices:
+                idx = int(idx)
+                if idx >= C or probs[t][idx] < 1e-6:
+                    continue
+                lp = log_p + float(np.log(probs[t][idx] + 1e-12))
+
+                if idx == BLANK:
+                    key = (prefix, BLANK)
+                elif idx == last:
+                    key = (prefix, idx)       # CTC 규칙: 연속 동일 문자는 병합
+                else:
+                    key = (prefix + (idx,), idx)
+
+                if key not in new_beams or lp > new_beams[key]:
+                    new_beams[key] = lp
+
+        # 빔 가지치기: 상위 beam_width*2 개만 유지
+        if len(new_beams) > beam_width * 2:
+            new_beams = dict(sorted(new_beams.items(), key=lambda x: x[1], reverse=True)[:beam_width * 2])
+        beams = new_beams
+
+    # 동일 prefix 합산 후 상위 top_n 추출
+    merged = {}
+    for (prefix, _), lp in beams.items():
+        if prefix not in merged or lp > merged[prefix]:
+            merged[prefix] = lp
+
+    results = []
+    for prefix, lp in sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_n]:
+        text = ''.join(char_list[i] for i in prefix if 0 < i < len(char_list))
+        avg_score = float(np.exp(lp / max(len(prefix), 1)))
+        results.append((text, avg_score))
+
+    return results if results else [("", 0.0)]
+
+# ═══════════════════════════════════════════════════════════════════
+# 모델 로드 (서버 기동 시 1회)
+# ═══════════════════════════════════════════════════════════════════
+yolo_model = YOLO(YOLO_PATH)
+
+eff_session    = ort.InferenceSession(EFF_PATH, providers=['CPUExecutionProvider'])
+eff_input_name = eff_session.get_inputs()[0].name
+
+# PaddleOCR: 5개국 모델 + Lock (동시 요청 시 predictor 보호)
+rec_predictors = {}
+char_dicts     = {}
+_ocr_locks     = {}
+
+for code, model_dir in OCR_MODELS.items():
     config = pdi.Config(
         os.path.join(model_dir, 'inference.pdmodel'),
         os.path.join(model_dir, 'inference.pdiparams')
@@ -128,103 +175,71 @@ def load_rec_predictor(country_code):
     config.enable_mkldnn()
     config.set_cpu_math_library_num_threads(4)
     config.switch_ir_optim(True)
-    rec_predictors[country_code] = pdi.create_predictor(config)
+    rec_predictors[code] = pdi.create_predictor(config)
 
-    # character dict 로드 (같은 폴더의 inference.yml)
-    yml_path = os.path.join(model_dir, 'inference.yml')
-    with open(yml_path, 'r', encoding='utf-8') as f:
-        yml = yaml.safe_load(f)
-    char_dicts[country_code] = ['blank'] + yml['PostProcess']['character_dict']
+    with open(os.path.join(model_dir, 'inference.yml'), 'r', encoding='utf-8') as f:
+        char_dicts[code] = ['blank'] + yaml.safe_load(f)['PostProcess']['character_dict']
 
-    n_chars = len(char_dicts[country_code])
-    print(f"  PaddleOCR rec ({country_code}): {model_dir} ({n_chars} chars)")
+    _ocr_locks[code] = threading.Lock()
+    print(f"  PaddleOCR ({code}): {len(char_dicts[code])} chars")
 
-import threading
-
-_ocr_locks = {}  # country_code -> Lock
 
 def run_ocr(country_code, plate_img):
-    """단일 국가 OCR 실행 → (text, score). Lock으로 thread-safe 보장."""
-    lock = _ocr_locks[country_code]
-    predictor = rec_predictors[country_code]
-    char_list = char_dicts[country_code]
+    """단일 국가 OCR 실행 → 상위 3개 후보 [(text, score), ...] 반환"""
+    norm_img = ocr_preprocess(plate_img)[np.newaxis, :]
 
-    norm_img = resize_norm_img(plate_img)[np.newaxis, :]
-
-    with lock:
-        input_handle = predictor.get_input_handle('x')
-        input_handle.reshape(norm_img.shape)
-        input_handle.copy_from_cpu(norm_img)
+    with _ocr_locks[country_code]:
+        predictor = rec_predictors[country_code]
+        handle = predictor.get_input_handle('x')
+        handle.reshape(norm_img.shape)
+        handle.copy_from_cpu(norm_img)
         predictor.run()
         output = predictor.get_output_handle(predictor.get_output_names()[0]).copy_to_cpu()
 
-    return ctc_decode(output[0], char_list)
+    return ctc_beam_decode(output[0], char_dicts[country_code])
 
-# 5개국 모델 전부 미리 로드
-for code in COUNTRY_MODEL_MAP:
-    load_rec_predictor(code)
-    _ocr_locks[code] = threading.Lock()
-
-# ─── 워밍업 & 서버 시작 ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# 서버 시작 (워밍업 → API 등록)
+# ═══════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("  모델 워밍업 시작...")
-    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    """MKL-DNN 그래프 컴파일을 위해 더미 추론 2회 실행 (첫 요청 지연 방지)"""
+    dummy_img   = np.zeros((640, 640, 3), dtype=np.uint8)
     dummy_plate = np.random.randint(0, 255, (120, 400, 3), dtype=np.uint8)
 
-    try:
-        yolo_model(dummy, verbose=False)
-        print("    YOLO 워밍업 완료")
-    except Exception as e:
-        print(f"    YOLO 워밍업 실패: {e}")
-
-    try:
-        eff_session.run(None, {eff_input_name: eff_preprocess(dummy_plate)})
-        print("    EfficientNet 워밍업 완료")
-    except Exception as e:
-        print(f"    EfficientNet 워밍업 실패: {e}")
-
-    try:
-        # 실제 추론과 동일한 크기로 2회씩 워밍업 (MKL-DNN 그래프 컴파일 완료)
-        for code in rec_predictors:
-            run_ocr(code, dummy_plate)
-            run_ocr(code, dummy_plate)
-        print("    PaddleOCR rec 워밍업 완료")
-    except Exception as e:
-        print(f"    PaddleOCR rec 워밍업 실패: {e}")
+    yolo_model(dummy_img, verbose=False)
+    eff_session.run(None, {eff_input_name: eff_preprocess(dummy_plate)})
+    for code in rec_predictors:
+        run_ocr(code, dummy_plate)
+        run_ocr(code, dummy_plate)
 
     print("  서버 준비 완료")
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# ─── API 엔드포인트 ──────────────────────────────────────────────
-@app.post("/license-plates-recognition")
-async def predict_all(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+@app.post("/license-plates-recognition")
+async def recognize(file: UploadFile = File(...)):
+    try:
+        # 이미지 디코딩
+        img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return {"status": "error", "message": "이미지 읽기 실패"}
 
         t1 = time.time()
 
-        # ── 1단계: YOLO 번호판 검출 ──
+        # ── 1단계: YOLO 번호판 검출 → 크롭 ──
         is_detected = False
         plate_crop = img
 
-        results = yolo_model(img)
-        if len(results[0].boxes) > 0:
-            box = results[0].boxes[0]
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        boxes = yolo_model(img)[0].boxes
+        if len(boxes) > 0:
+            x1, y1, x2, y2 = map(int, boxes[0].xyxy[0])
             h_img, w_img = img.shape[:2]
-            pad = int((x2 - x1) * 0.03)  # 너비의 3% 패딩
-            x1 = max(0, x1 - pad)
-            y1 = max(0, y1 - pad)
-            x2 = min(w_img, x2 + pad)
-            y2 = min(h_img, y2 + pad)
+            pad = int((x2 - x1) * 0.03)
+            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+            x2, y2 = min(w_img, x2 + pad), min(h_img, y2 + pad)
             plate_crop = img[y1:y2, x1:x2]
             is_detected = True
 
@@ -233,77 +248,58 @@ async def predict_all(file: UploadFile = File(...)):
 
         t2 = time.time()
 
-        # ── 2단계: EfficientNet 국가 분류 ──
+        # ── 2단계: EfficientNet 국가 분류 → 확률순 정렬 ──
         logits    = eff_session.run(None, {eff_input_name: eff_preprocess(plate_crop)})[0][0]
         e         = np.exp(logits - logits.max())
         all_probs = e / e.sum()
-        max_idx   = int(np.argmax(all_probs))
-        max_prob  = float(all_probs[max_idx])
 
-        country_code     = COUNTRY_MAP.get(max_idx, 'KOR')
-        country_accuracy = round(max_prob * 100, 2)
+        country_code     = COUNTRY_MAP[int(np.argmax(all_probs))]
+        country_accuracy = round(float(all_probs.max()) * 100, 2)
+        ranked_countries = [COUNTRY_MAP[int(i)] for i in np.argsort(all_probs)[::-1]]
 
         t3 = time.time()
 
-        # ── 3단계: 5개국 OCR 병렬 실행 + 정규식 검증 ──
-        def ocr_worker(code):
-            text, score = run_ocr(code, plate_crop)
-            valid = validate_plate(text, code)
-            return (code, text, score, valid)
-
-        candidates = []
-        try:
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                candidates = list(executor.map(ocr_worker, COUNTRY_MODEL_MAP.keys()))
-        except Exception as ocr_err:
-            print(f"  OCR 오류: {ocr_err}")
-
-        # 정규식 통과한 결과 중 OCR 점수 최고 선택
-        # EUR은 정규식이 느슨 → 다른 국가가 통과하면 EUR보다 우선
-        valid_results  = [(c, t, s) for c, t, s, v in candidates if v]
-        strict_results = [(c, t, s) for c, t, s in valid_results if c != 'EUR']
+        # ── 3단계: 확률 높은 국가부터 순차 OCR → 정규식 통과 시 확정 ──
+        v_num    = "인식불가"
+        acc      = 0.0
         is_valid = False
+        attempts = []
 
-        if strict_results:
-            best = max(strict_results, key=lambda x: x[2])
-            country_code     = best[0]
-            v_num            = best[1]
-            acc              = round(best[2] * 100, 2)
-            country_accuracy = round(float(all_probs[list(COUNTRY_MAP.values()).index(country_code)]) * 100, 2)
-            is_valid         = True
-        elif valid_results:
-            best = max(valid_results, key=lambda x: x[2])
-            country_code     = best[0]
-            v_num            = best[1]
-            acc              = round(best[2] * 100, 2)
-            country_accuracy = round(float(all_probs[list(COUNTRY_MAP.values()).index(country_code)]) * 100, 2)
-            is_valid         = True
-        else:
-            # 정규식 통과 없음 → EfficientNet 1순위의 OCR 결과 사용
-            eff_country = COUNTRY_MAP.get(max_idx, 'KOR')
-            eff_result = next(((c, t, s) for c, t, s, v in candidates if c == eff_country), None)
-            if eff_result:
-                v_num = eff_result[1] or "Unknown"
-                acc   = round(eff_result[2] * 100, 2)
-            else:
-                v_num = "Unknown"
-                acc   = 0.0
+        for rank, code in enumerate(ranked_countries, 1):
+            try:
+                candidates = run_ocr(code, plate_crop)
+                for ci, (text, score) in enumerate(candidates, 1):
+                    valid = validate_plate(text, code)
+                    attempts.append((code, text, score, valid, rank, ci))
+
+                    if valid and not is_valid:
+                        country_code     = code
+                        v_num            = text
+                        acc              = round(score * 100, 2)
+                        country_accuracy = round(float(all_probs[list(COUNTRY_MAP.values()).index(code)]) * 100, 2)
+                        is_valid         = True
+            except Exception as ocr_err:
+                print(f"    {rank}순위 {code}: OCR 오류 → {ocr_err}")
+
+            if is_valid:
+                break
 
         t4 = time.time()
 
-        # ── 응답 생성 ──
-        _, plate_encoded = cv2.imencode('.jpg', plate_crop)
-        plate_base64 = base64.b64encode(plate_encoded).decode('utf-8')
+        # ── 콘솔 로그 ──
+        print("=" * 75)
+        print(f"결과 : {country_code} | {v_num} ({acc}%) | {'정규식 통과' if is_valid else '인식불가'}")
+        print(f"EFF  : {' > '.join(ranked_countries)}")
+        for c, t, s, v, r, ci in attempts:
+            mark = "→" if c == country_code and v else " "
+            print(f"  {mark} {r}순위 {c} 후보{ci}: {t or '(빈 결과)'} ({round(s*100,2)}%) {'[통과]' if v else ''}")
+        if not is_valid:
+            print(f"  ※ 5개국 전부 정규식 실패 → 인식불가")
+        print(f"속도 : YOLO {t2-t1:.3f}s | EFF {t3-t2:.3f}s | OCR {t4-t3:.3f}s | 합계 {t4-t1:.3f}s")
+        print("=" * 75)
 
-        print("===========================================================================")
-        print(f"결과 : {country_code} | {v_num} ({acc}%) | 정규식: {'통과' if is_valid else '실패'}")
-        print(f"EFF  : {COUNTRY_MAP.get(max_idx)} ({round(max_prob*100,2)}%)")
-        for c, t, s, v in candidates:
-            mark = "→" if c == country_code else " "
-            print(f"  {mark} {c}: {t} ({round(s*100,2)}%) {'[정규식 통과]' if v else ''}")
-        print(f"YOLO : {is_detected} | YOLO: {t2-t1:.3f}s | EfficientNet: {t3-t2:.3f}s | OCR: {t4-t3:.3f}s | 합계: {t4-t1:.3f}s")
-        print("===========================================================================")
-
+        # ── 응답 ──
+        _, encoded = cv2.imencode('.jpg', plate_crop)
         return {
             "status": "success",
             "is_yolo_detected": is_detected,
@@ -312,13 +308,13 @@ async def predict_all(file: UploadFile = File(...)):
             "vehicle_num": v_num,
             "ocr_accuracy": acc,
             "is_ev_license_plate": False,
-            "plate_img_base64": plate_base64
+            "plate_img_base64": base64.b64encode(encoded).decode('utf-8')
         }
 
     except Exception as e:
-        print(f"  전체 프로세스 에러!")
         traceback.print_exc()
         return {"status": "error", "message": f"AI 서버 오류: {str(e)}"}
+
 
 if __name__ == "__main__":
     import uvicorn

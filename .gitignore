@@ -13,15 +13,21 @@ __pycache__/
 .vscode/
 .cursor/
 
-# 원본 데이터 폴더들 무시
+# 자동차 번호판 데이터셋
+brazil/
+china/
+europe/
+india/
+korea/
+korea_addition/
+malaysia/
+only_yolo/
+
+# 파인튜닝용 폴더
 PaddleOCR/
 country_classification_data_v1/
 ocr_train_data_v1/
 yolo_train_data_v1/
-
-# 추가 데이터셋
-korea_addition/
-malaysia/
 
 # 파인튜닝 모델
 finetuned_models/

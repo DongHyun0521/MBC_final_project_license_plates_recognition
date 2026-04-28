@@ -19,6 +19,10 @@ from contextlib import asynccontextmanager
 from ultralytics import YOLO
 import paddle.inference as pdi
 import onnxruntime as ort
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
 
 os.environ['FLAGS_enable_pir_api'] = '0'
 
@@ -27,11 +31,14 @@ os.environ['FLAGS_enable_pir_api'] = '0'
 # ═══════════════════════════════════════════════════════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 모델 경로
-YOLO_ONNX = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.onnx')
-YOLO_PT   = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolo_11n', 'finetuned_yolo11n_acc822.pt')
+# YOLO 모델 경로
+YOLO_ONNX = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolov11small640_acc8400', 'best.onnx')
+YOLO_PT   = os.path.join(BASE_DIR, 'finetuned_models', 'yolo', 'yolov11small640_acc8400', 'best.pt')
 YOLO_PATH = YOLO_ONNX if os.path.exists(YOLO_ONNX) else YOLO_PT
-EFF_PATH  = os.path.join(BASE_DIR, 'finetuned_models', 'efficient_net', 'efficient_net_b0', 'finetuned_efficientnetb0.onnx')
+EFF_PATH  = os.path.join(BASE_DIR, 'finetuned_models', 'country_classification', 'efficientnet_b0', 'country_efficientnetb0_v3.onnx')
+
+# EV 분류기 (한국 번호판 전용, 파인튜닝된 EfficientNet-B0, ONNX)
+EV_MODEL_PATH = os.path.join(BASE_DIR, 'finetuned_models', 'ev_classification', 'mobilenet_v3', 'ev_mobilenetv3_v2.onnx')
 
 # EfficientNet 출력 인덱스 → 국가코드
 COUNTRY_MAP = {0: 'BRA', 1: 'CHN', 2: 'EUR', 3: 'IND', 4: 'KOR'}
@@ -160,6 +167,31 @@ yolo_model = YOLO(YOLO_PATH)
 eff_session    = ort.InferenceSession(EFF_PATH, providers=['CPUExecutionProvider'])
 eff_input_name = eff_session.get_inputs()[0].name
 
+# EV 분류기 (EfficientNet-B0, ONNX, 2-class: ev_false=0, ev_true=1)
+ev_session    = ort.InferenceSession(EV_MODEL_PATH, providers=['CPUExecutionProvider'])
+ev_input_name = ev_session.get_inputs()[0].name
+print(f"  EV Classifier (EfficientNet-B0, ONNX): {EV_MODEL_PATH}")
+
+_EV_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+
+def predict_ev(plate_img_bgr):
+    """번호판 크롭 이미지에서 EV 여부 판별 (한국 번호판 전용, ONNX 추론)
+    Returns: (is_ev: bool, ev_confidence: float 0~1)
+    """
+    rgb = cv2.cvtColor(plate_img_bgr, cv2.COLOR_BGR2RGB)
+    tensor = _EV_TRANSFORM(Image.fromarray(rgb)).unsqueeze(0).numpy()  # (1,3,224,224)
+    logits = ev_session.run(None, {ev_input_name: tensor})[0]          # (1, 2)
+    # softmax (수치 안정성 위해 max를 빼서 계산)
+    e = np.exp(logits - logits.max(axis=1, keepdims=True))
+    probs = e / e.sum(axis=1, keepdims=True)
+    ev_prob = float(probs[0, 1])  # class 1 = ev_true
+    return ev_prob > 0.5, ev_prob
+
 # PaddleOCR: 5개국 모델 + Lock (동시 요청 시 predictor 보호)
 rec_predictors = {}
 char_dicts     = {}
@@ -204,14 +236,27 @@ def run_ocr(country_code, plate_img):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """MKL-DNN 그래프 컴파일을 위해 더미 추론 2회 실행 (첫 요청 지연 방지)"""
+    print("  워밍업 시작...")
     dummy_img   = np.zeros((640, 640, 3), dtype=np.uint8)
     dummy_plate = np.random.randint(0, 255, (120, 400, 3), dtype=np.uint8)
 
+    t = time.time()
     yolo_model(dummy_img, verbose=False)
+    print(f"    YOLO 워밍업 완료 ({time.time()-t:.2f}s)")
+
+    t = time.time()
     eff_session.run(None, {eff_input_name: eff_preprocess(dummy_plate)})
+    print(f"    EfficientNet 워밍업 완료 ({time.time()-t:.2f}s)")
+
+    t = time.time()
+    predict_ev(dummy_plate)
+    print(f"    MobileNet-V3 워밍업 완료 ({time.time()-t:.2f}s)")
+
     for code in rec_predictors:
+        t = time.time()
         run_ocr(code, dummy_plate)
         run_ocr(code, dummy_plate)
+        print(f"    PaddleOCR ({code}) 워밍업 완료 ({time.time()-t:.2f}s)")
 
     print("  서버 준비 완료")
     yield
@@ -286,16 +331,33 @@ async def recognize(file: UploadFile = File(...)):
 
         t4 = time.time()
 
+        # ── 4단계: EV 판별 (한국 번호판만) ──
+        is_ev = False
+        ev_conf = 0.0
+        if country_code == 'KOR':
+            is_ev, ev_conf = predict_ev(plate_crop)
+
+        t5 = time.time()
+
         # ── 콘솔 로그 ──
+        # 5개국 분류 확률을 확률순으로 정렬 (국가명 + %)
+        sorted_idx = np.argsort(all_probs)[::-1]
+        eff_ranking = " > ".join(
+            f"{COUNTRY_MAP[int(i)]}({float(all_probs[i]) * 100:.2f}%)" for i in sorted_idx
+        )
+
         print("=" * 75)
-        print(f"결과 : {country_code} | {v_num} ({acc}%) | {'정규식 통과' if is_valid else '인식불가'}")
-        print(f"EFF  : {' > '.join(ranked_countries)}")
+        print(f"결과  : {country_code} ({country_accuracy}%) | {v_num} ({acc}%)")
+        print(f"YOLO  : {'적용' if is_detected else '미적용'}")
+        print(f"Eff   : {eff_ranking}")
         for c, t, s, v, r, ci in attempts:
-            mark = "→" if c == country_code and v else " "
-            print(f"  {mark} {r}순위 {c} 후보{ci}: {t or '(빈 결과)'} ({round(s*100,2)}%) {'[통과]' if v else ''}")
+            tag = " [정규식 통과]" if v else ""
+            print(f"Eff-{r} : {c} | YOLO-{ci} : {t or '(빈 결과)'} ({round(s*100, 2)}%){tag}")
         if not is_valid:
-            print(f"  ※ 5개국 전부 정규식 실패 → 인식불가")
-        print(f"속도 : YOLO {t2-t1:.3f}s | EFF {t3-t2:.3f}s | OCR {t4-t3:.3f}s | 합계 {t4-t1:.3f}s")
+            print(f"!! 5개국 정규식 모두 실패 (인식불가)")
+        if country_code == 'KOR':
+            print(f"EV    : {'전기차 ✓' if is_ev else '일반 차량'} (EV 확률 {ev_conf*100:.2f}%)")
+        print(f"속도  : YOLO {t2-t1:.3f}s | Eff {t3-t2:.3f}s | OCR {t4-t3:.3f}s | EV {t5-t4:.3f}s | 합계 {t5-t1:.3f}s")
         print("=" * 75)
 
         # ── 응답 ──
@@ -307,7 +369,8 @@ async def recognize(file: UploadFile = File(...)):
             "country_accuracy": country_accuracy,
             "vehicle_num": v_num,
             "ocr_accuracy": acc,
-            "is_ev_license_plate": False,
+            "is_ev_license_plate": is_ev,
+            "ev_confidence": round(ev_conf * 100, 2),
             "plate_img_base64": base64.b64encode(encoded).decode('utf-8')
         }
 
@@ -319,3 +382,4 @@ async def recognize(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
+ 

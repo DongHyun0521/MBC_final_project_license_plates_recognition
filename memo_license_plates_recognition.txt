@@ -1368,18 +1368,38 @@ PaddleOCR 모델 1개에 모든 번호판 파인튜닝
 
 
 
+==================================================
 
 
 
+AIHub: 128장
 
 
 
+- 파인튜닝
+
+EfficientNet_B0
+MobileNetv3
+ResNet18
+
+train/ev_false : 79,879
+train/ev_ture : 319
+val/ev_false : 9,993
+val/ev_true : 80
+
+데이터 불균형
+ev_true를 ev_false보다 250번 더 뽑음
+뽑은 이미지는 아규멘테이션 적용하여 과적합 방지
 
 
+=== 최종 결과 ===
+Model                Balanced Acc   EV Recall    EV Precision   EV F1     
+----------------------------------------------------------------------
+efficientnet_b0      0.9958         1.0000       0.4878         0.6557    
+mobilenet_v3         0.9990         1.0000       0.8081         0.8939    
+resnet18             0.9984         1.0000       0.7207         0.8377    
 
-
-
-
+최고 성능 모델: mobilenet_v3 (Balanced Acc: 0.9990)
 
 
 

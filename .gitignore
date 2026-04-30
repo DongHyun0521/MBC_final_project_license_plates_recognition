@@ -20,12 +20,3 @@ yolo_train_data_v1/
 korea_ev/
 
 finetuned_models/
-
-*.jpg
-*.jpeg
-*.png
-*.avif
-*.webp
-*.svg
-*.gif
-*.bmp

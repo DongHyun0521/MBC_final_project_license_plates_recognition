@@ -11,6 +11,7 @@ korea/
 korea_addition/
 malaysia/
 only_yolo/
+spain/
 
 PaddleOCR/
 country_classification_data_v1/
@@ -20,4 +21,11 @@ korea_ev/
 
 finetuned_models/
 
-googling/
+*.jpg
+*.jpeg
+*.png
+*.avif
+*.webp
+*.svg
+*.gif
+*.bmp
